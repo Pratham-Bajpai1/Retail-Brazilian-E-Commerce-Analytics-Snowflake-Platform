@@ -1,0 +1,287 @@
+add package in anaconda, python  version 3.11 and add plotly 6.6.0
+
+
+
+
+import streamlit as st
+from snowflake.snowpark.context import get_active_session
+import plotly.express as px
+import pandas as pd
+
+
+# page configuration
+st.set_page_config(layout="wide", page_title="Brazilian E-Commerce Analytics")
+st.title("📊 Brazilian E-Commerce Analytics Dashboard")
+
+# sidebar - global settings
+st.sidebar.header("Global Settings")
+
+
+# currency Map (base: USD)
+currency_map = {
+    "USD ($)": {"symbol": "$", "rate": 1.0},
+    "BRL (R$)": {"symbol": "R$", "rate": 4.99},
+    "INR (₹)": {"symbol": "₹", "rate": 95.09},
+    "EUR (€)": {"symbol": "€", "rate": 0.85},
+    "GBP (£)": {"symbol": "£", "rate": 0.74},
+    "JPY (¥)": {"symbol": "¥", "rate": 157.18},
+    "CAD (C$)": {"symbol": "C$", "rate": 1.36}
+}
+
+currency_selection = st.sidebar.selectbox("Select Currency", list(currency_map.keys()))
+
+# conversion properties
+curr_symbol = currency_map[currency_selection]["symbol"]
+conv_factor = currency_map[currency_selection]["rate"]
+
+
+# formatting helper for KPIs ($15.42M, B etc.)
+def format_large_number(num):
+    if num >= 1_000_000:
+        return f"{curr_symbol}{num / 1_000_000:.2f}M"
+    elif num >= 1_000:
+        return f"{curr_symbol}{num / 1_000:.1f}K"
+    else:
+        return f"{curr_symbol}{num:,.2f}"
+
+
+# get active snowflake session
+session = get_active_session()
+
+
+#  SECTION 1: EXECUTIVE OVERVIEW (KPIs)
+st.header("1. Executive Overview")
+kpi_col1, kpi_col2, kpi_col3, kpi_col4, kpi_col5, kpi_col6 = st.columns(6)
+
+kpi_query = """
+    SELECT 
+        COUNT(DISTINCT order_id) AS total_orders,
+        COUNT(DISTINCT customer_key) AS total_customers,
+        SUM(price + freight_value) AS total_revenue,
+        SUM(price + freight_value)/COUNT(DISTINCT order_id) AS avg_order_value,
+        (SELECT AVG(DATEDIFF(day, order_purchase_ts, order_delivered_customer_ts)) 
+    FROM SILVER.ORDERS_CLEAN 
+    WHERE order_status = 'delivered') AS avg_delivery,
+        (SELECT AVG(review_score) FROM SILVER.REVIEWS_CLEAN) AS avg_sat
+    FROM GOLD.FACT_SALES
+    WHERE order_status = 'delivered'
+"""
+kpis = session.sql(kpi_query).collect()[0]
+
+revenue_val = float(kpis['TOTAL_REVENUE']) * conv_factor
+aov_val = float(kpis['AVG_ORDER_VALUE']) * conv_factor
+
+kpi_col1.metric("💰 Total Revenue", format_large_number(revenue_val))
+kpi_col2.metric("📦 Total Orders", f"{kpis['TOTAL_ORDERS']:,}")
+kpi_col3.metric("👤 Total Customers", f"{kpis['TOTAL_CUSTOMERS']:,}")
+kpi_col4.metric("📊 Avg Order Value", f"{curr_symbol}{aov_val:,.2f}")
+kpi_col5.metric("🚚 Avg Delivery", f"{kpis['AVG_DELIVERY']:.1f} Days")
+kpi_col6.metric("⭐ Avg Satisfaction", f"{kpis['AVG_SAT']:.1f} / 5")
+
+st.divider()
+
+
+# SECTION 2: SALES & PRODUCT PERFORMANCE
+st.header("2. Sales & Product Performance")
+col_trend, col_cat = st.columns(2)
+
+with col_trend:
+    st.subheader(f"Monthly Revenue Trends ({currency_selection})")
+    trend_df = session.sql("""
+        SELECT TO_VARCHAR(d.date, 'Mon YYYY') AS month, 
+        SUM(f.price + f.freight_value) AS revenue,
+        MIN(d.date) as sort_date
+        FROM GOLD.FACT_SALES f
+        JOIN GOLD.DIM_DATE d 
+        ON f.date_key = d.date_key
+        WHERE f.order_status = 'delivered'
+        GROUP BY 1 ORDER BY sort_date
+    """).to_pandas()
+    trend_df['REVENUE'] = trend_df['REVENUE'] * conv_factor
+    fig_trend = px.line(trend_df, x='MONTH', y='REVENUE', markers=True, color_discrete_sequence=['#00CC96'],
+                        labels={"REVENUE": f"Revenue ({curr_symbol})"})
+    st.plotly_chart(fig_trend, use_container_width=True)
+
+with col_cat:
+    st.subheader(f"Top 10 Categories by Revenue ({curr_symbol})")
+    cat_df = session.sql("""
+        SELECT dp.category, SUM(fs.price + fs.freight_value) AS revenue
+        FROM GOLD.FACT_SALES fs
+        JOIN GOLD.DIM_PRODUCTS dp 
+        ON fs.product_key = dp.product_key
+        WHERE fs.order_status = 'delivered'
+        GROUP BY 1 ORDER BY 2 DESC LIMIT 10
+    """).to_pandas()
+    cat_df['REVENUE'] = cat_df['REVENUE'] * conv_factor
+    fig_cat = px.bar(cat_df, x='REVENUE', y='CATEGORY', orientation='h', color='REVENUE', color_continuous_scale='Viridis')
+    st.plotly_chart(fig_cat, use_container_width=True)
+
+st.divider()
+
+
+# SECTION 3: OPERATIONS & LOGISTICS
+st.header("3. Operations & Logistics")
+col_status, col_ship = st.columns(2)
+
+with col_status:
+    st.subheader("Order Status Distribution")
+    status_df = session.sql("""
+        SELECT order_status, 
+        COUNT(DISTINCT order_id) as count 
+        FROM GOLD.FACT_SALES 
+        GROUP BY 1
+    """).to_pandas()
+    fig_status = px.pie(status_df, values='COUNT', names='ORDER_STATUS', hole=0.4)
+    st.plotly_chart(fig_status, use_container_width=True)
+
+with col_ship:
+    st.subheader("Shipping Cost Ratio by Category")
+    ship_df = session.sql("""
+        SELECT p.category, ROUND((SUM(f.freight_value) / NULLIF(SUM(f.price), 0)) * 100, 2) AS shipping_ratio
+        FROM GOLD.FACT_SALES f
+        JOIN GOLD.DIM_PRODUCTS p 
+        ON f.product_key = p.product_key
+        WHERE f.order_status = 'delivered'
+        GROUP BY 1 
+        HAVING SUM(f.price) > 5000 
+        ORDER BY 2 DESC 
+        LIMIT 10
+    """).to_pandas()
+    fig_ship = px.bar(ship_df, x='SHIPPING_RATIO', y='CATEGORY', color='SHIPPING_RATIO', color_continuous_scale='Reds')
+    st.plotly_chart(fig_ship, use_container_width=True)
+    st.info("**Actionable Insight:** Heavy items like 'Home Comfort' and 'Furniture' show high shipping ratios (>35%), impacting margins.")
+
+st.divider()
+
+
+# --- SECTION 4: GEOGRAPHY & CUSTOMER INSIGHTS ---
+st.header("4. Geography & Customer Insights")
+col_state, col_seg = st.columns(2)
+
+with col_state:
+    st.subheader(f"Sales by State ({curr_symbol})")
+    state_df = session.sql("""
+        SELECT c.state, 
+        SUM(f.price + f.freight_value) AS revenue
+        FROM GOLD.FACT_SALES f
+        JOIN GOLD.DIM_CUSTOMERS c 
+        ON f.customer_key = c.customer_key
+        WHERE f.order_status = 'delivered'
+        GROUP BY 1 
+        ORDER BY 2 DESC
+    """).to_pandas()
+    state_df['REVENUE'] = state_df['REVENUE'] * conv_factor
+    st.dataframe(state_df.style.format({"REVENUE": f"{curr_symbol}{{0:,.2f}}"}), use_container_width=True)
+
+with col_seg:
+    st.subheader("Customer Value Segmentation")
+    # segmentation thresholds also scale with currency
+    high_val = 1000 * conv_factor
+    med_val = 500 * conv_factor
+    
+    seg_df = session.sql(f"""
+        SELECT segment, 
+        COUNT(*) AS customers
+        FROM (
+            SELECT customer_key,
+                CASE
+                    WHEN SUM(price + freight_value) * {conv_factor} > {high_val} THEN 'High Value'
+                    WHEN SUM(price + freight_value) * {conv_factor} > {med_val} THEN 'Medium Value'
+                    ELSE 'Low Value'
+                END AS segment
+            FROM GOLD.FACT_SALES
+            WHERE order_status = 'delivered'
+            GROUP BY customer_key
+        ) GROUP BY segment 
+        ORDER BY segment
+    """).to_pandas()
+    fig_seg = px.pie(seg_df, values='CUSTOMERS', names='SEGMENT', color='SEGMENT',
+                     color_discrete_map={'High Value':'#EF553B', 'Medium Value':'#636EFA', 'Low Value':'#00CC96'})
+    st.plotly_chart(fig_seg, use_container_width=True)
+
+st.divider()
+
+
+# --- SECTION 5: CUSTOMER EXPERIENCE & SELLERS ---
+st.header("5. Experience & Seller Performance")
+col_rev, col_sell = st.columns(2)
+
+with col_rev:
+    st.subheader("Review Score Distribution")
+    review_df = session.sql("""
+        SELECT review_score, 
+        COUNT(*) AS total 
+        FROM SILVER.REVIEWS_CLEAN 
+        GROUP BY 1 
+        ORDER BY 1
+    """).to_pandas()
+    fig_rev = px.bar(review_df, x='REVIEW_SCORE', y='TOTAL', color='REVIEW_SCORE', color_continuous_scale='RdYlGn')
+    st.plotly_chart(fig_rev, use_container_width=True)
+
+with col_sell:
+    st.subheader(f"Top 5 Seller Hubs ({curr_symbol})")
+    seller_df = session.sql("""
+        SELECT ds.seller_city, 
+        ds.seller_state, 
+        COUNT(DISTINCT fs.order_id) as orders, 
+        SUM(fs.price + fs.freight_value) as sales
+        FROM GOLD.FACT_SALES fs
+        JOIN GOLD.DIM_SELLERS ds 
+        ON fs.seller_key = ds.seller_key
+        WHERE fs.order_status = 'delivered'
+        GROUP BY 1, 2 
+        ORDER BY 4 DESC 
+        LIMIT 5
+    """).to_pandas()
+    seller_df['SALES'] = seller_df['SALES'] * conv_factor
+    st.table(seller_df.style.format({"SALES": f"{curr_symbol}{{0:,.2f}}"}))
+
+st.divider()
+
+
+# --- SECTION 6: STRATEGIC INSIGHTS ---
+st.header("6. Strategic Business Insights")
+col_pay, col_repeat = st.columns(2)
+
+with col_pay:
+    st.subheader("Payment Method Distribution")
+    pay_type_df = session.sql("""
+        SELECT payment_type, 
+        COUNT(DISTINCT order_id) AS total_orders 
+        FROM SILVER.PAYMENTS_CLEAN 
+        GROUP BY 1 
+        ORDER BY 2 DESC
+    """).to_pandas()
+    fig_pay = px.pie(pay_type_df, values='TOTAL_ORDERS', names='PAYMENT_TYPE', hole=0.5, color_discrete_sequence=px.colors.sequential.Plasma)
+    st.plotly_chart(fig_pay, use_container_width=True)
+
+with col_repeat:
+    st.subheader("Customer Loyalty (Order Count)")
+    repeat_df = session.sql("""
+        SELECT order_count, 
+        COUNT(*) as customer_count 
+        FROM (
+            SELECT customer_key, 
+            COUNT(order_id) as order_count 
+            FROM GOLD.FACT_SALES 
+            WHERE order_status = 'delivered' 
+            GROUP BY 1
+        ) 
+        GROUP BY 1 
+        ORDER BY 1
+    """).to_pandas()
+    fig_repeat = px.bar(repeat_df[repeat_df['ORDER_COUNT'] < 5], x='ORDER_COUNT', y='CUSTOMER_COUNT', color_discrete_sequence=['#636EFA'])
+    st.plotly_chart(fig_repeat, use_container_width=True)
+
+st.subheader(f"Revenue per Order Distribution ({curr_symbol})")
+rev_dist_df = session.sql("""
+    SELECT order_id, 
+    SUM(price + freight_value) as total_order_value 
+    FROM GOLD.FACT_SALES 
+    WHERE order_status = 'delivered' 
+    GROUP BY 1
+""").to_pandas()
+rev_dist_df['TOTAL_ORDER_VALUE'] = rev_dist_df['TOTAL_ORDER_VALUE'] * conv_factor
+fig_rev_dist = px.histogram(rev_dist_df, x="TOTAL_ORDER_VALUE", nbins=100, color_discrete_sequence=['salmon'])
+fig_rev_dist.update_layout(xaxis_range=[0, 1000 * conv_factor], xaxis_title=f"Order Value ({curr_symbol})")
+st.plotly_chart(fig_rev_dist, use_container_width=True)
